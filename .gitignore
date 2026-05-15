@@ -1,6 +1,20 @@
-*.bin
+## Project artifacts
+runs/
+outputs/
+output/
+checkpoints/
+saved_models/
 models/
 data/
+wandb/
+
+## Model weights / exports
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
 
 nav
 tags
