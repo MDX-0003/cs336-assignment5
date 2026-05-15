@@ -5,7 +5,6 @@ output/
 checkpoints/
 saved_models/
 models/
-data/
 wandb/
 
 ## Model weights / exports
