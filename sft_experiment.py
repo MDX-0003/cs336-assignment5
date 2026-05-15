@@ -1,6 +1,10 @@
+import os
+
+# vllm 0.10.0 uses msgpack by default; collective_rpc with callable requires pickle fallback
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 from vllm import LLM,SamplingParams
 import argparse
-import os
 import random
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -21,6 +25,7 @@ from tests.adapters import (
     run_sft_microbatch_train_step as sft_microbatch_train_step,
 )
 from transformers import Adafactor
+from tqdm import tqdm
 
 
 
@@ -145,8 +150,13 @@ def build_math_val_prompts_and_gts(val_path: str, prompt_path: str, val_num: int
 # ====================== policy/llm ======================
 def load_policy_into_vllm_instance(policy, llm: LLM):
     state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
+
+    def _load_weights(worker):
+        model = worker.get_model()
+        model.load_weights(state_dict.items())
+        return True
+    # main thread send func to sub thread
+    llm.llm_engine.collective_rpc(_load_weights)
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     vllm_set_random_seed(seed)
     world_size_path = patch("torch.distributed.get_world_size", return_value=1)
@@ -155,10 +165,10 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
         return_value=None
     )
     #patch : runtime replace internal func return val ,vllm skip memory check and set gpu num
+    # vllm>=0.10.0 removed the `device` kwarg; device is auto-detected from CUDA
     with world_size_path, profiling_patch:
         return LLM(
             model=model_id,
-            device=device,
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -211,7 +221,7 @@ def evaluate_vllm(
 def main():
     ap = argparse.ArgumentParser()
     # ====================== paths ======================
-    ap.add_argument("--model_path", default="data/a5-alignment/models/Qwen2.5-Math-1.5B")
+    ap.add_argument("--model_path", default="cs336_alignment/models/Qwen2.5-Math-1.5B")
     ap.add_argument("--sft_path", default="data/MATH/sft.jsonl")
     ap.add_argument("--val_path", default="data/MATH/validation.jsonl")
     ap.add_argument("--prompt_path", default="cs336_alignment/prompts/r1_zero.prompt")
@@ -315,9 +325,11 @@ def main():
 
     opt.zero_grad(set_to_none=True)
 
+    pbar = tqdm(total=args.max_steps, desc="SFT training", unit="step")
     for epoch in range(10_000_000):
         for batch in loader:
             step += 1
+            pbar.update(1)
             # in dataLoader.collate_fn , example ==> [input_ids....]
             input_ids = batch["input_ids"].to(args.train_device)
             labels = batch["labels"].to(args.train_device)
@@ -342,6 +354,7 @@ def main():
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 opt_step += 1
+                pbar.set_postfix(loss=f"{float(loss.detach()):.4f}", opt_step=opt_step)
                 if opt_step % 10 == 0:
                     log_event({"type": "train_loss", "loss": float(loss.detach())}, also_print=False)
             
@@ -396,6 +409,7 @@ def main():
                     break
         if step >= args.max_steps:
             break
+    pbar.close()
     # save
     policy.save_pretrained(str(run_dir))
     tokenizer.save_pretrained(str(run_dir))
