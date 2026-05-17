@@ -10,6 +10,33 @@ uv run pytest tests/test_sft.py -k masked_normalize -q
 
 
 
+## 算法里难以理解的部分
+
+### SFT和GRPO的loss
+
+advantage/reward都是response/sequence层级的，也就是说一条问答只有一个标量分数
+
+SFT只关心输出序列里，每个token位置上，正答token的概率，**没有reward，没有advantage**
+
+```
+loss = -masked_sum(policy_log_probs on response tokens)
+```
+
+GRPO要让同一个问题采样多次（rollout），算组内优势，然后advantage(seq层级)去和log_prob(token层级)相乘，得到loss（我们称为policy gradient loss，维度[B,T]）
+
+```
+advantage = (reward - group_mean) / (group_std + eps)
+loss = -advantages * policy_log_probs
+```
+
+micro batch维度，尽管每个seq都能拿到 [B,T] loss，也还是要用run_masked_mean来压缩成一个标量
+
+### 旧policy和ref区分
+
+如果要对loss进行clip，就需要用policy除以旧policy来得到重要性采样权重。换言之需要在循环里额外采样一次old_log_prob
+
+Ref只会在
+
 ## run_tokenize_prompt_and_output()
 
 ### 理念讨论
@@ -341,7 +368,7 @@ mask.to(dtype = tensor.dtype).sum(dim=dim).clamp_min(1e-8)
 
 测试代码期待一个NaN，因此去掉clamp更好
 
-## run_compute_group_normalized_rewards
+## advantage计算=run_compute_group_normalized_rewards
 
 听名字就知道，组内归一化奖励。
 
@@ -565,16 +592,14 @@ loss = -torch.minimum(raw_objective,clip_objective)
 
 - no_baseline : run_compute_naive_policy_gradient_loss
 
-  
-
 - reinforce_with_baseline:run_compute_naive_policy_gradient_loss
 
 - grpo_clip: run_compute_grpo_clip_loss
 
-回顾一下，naive的公式始终是：，前两个type的区别在于A选什么，是raw reward 还是 raw reward - 组内平均reward (组内优势)
+回顾一下，naive的公式始终是下面的第一行，前两个type的区别在于A选什么，是raw reward 还是 raw reward - 组内平均reward (组内优势)
 
 ```
-loss = -A * log_prob(π,当前策略)
+loss = -A * log_prob(π=当前策略)
 loss = -min(ratio * A, clipped_ratio * A)
 ```
 
@@ -606,5 +631,82 @@ loss / gradient_accumulation_steps
         v
 backward()
 
+```
+
+
+
+## sft_experiment
+
+### micro_batch_size的影响
+
+初版代码里是这样：
+
+```
+loss, meta = sft_microbatch_train_step(...)
+
+            if step % args.grad_acc_steps == 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                opt_step += 1
+                pbar.set_postfix(loss=f"{float(loss.detach()):.4f}", opt_step=opt_step)
+                if opt_step % 10 == 0:
+                    log_event({"type": "train_loss", "loss": float(loss.detach())}, also_print=False)
+            
+```
+
+假设一个micro_batch是2，而grad_acc_steps是16，相当于把一个32的大batch拆分成16个小batch，累积16次梯度然后反传参数。但是代码里每次只打印出来最后一个小batch的loss，所以参数也许更新正确，但是打印出来的loss是比较不稳定的。
+
+因为小的batch里面，某个得分特别高/特别低的样本会对当前batch的loss带来很大影响（batch小，loss方差大）
+
+最好loss = xxx ,if xx print loss的逻辑中间，加一个累积多次loss的变量，print 被累积loss的均值而不是最后一次loss
+
+### micro_batch_size增大有哪些影响？
+
+**显存**
+
+```
+input_ids / labels / masks activations attention 中间状态 logits 反向传播保存的中间结果 
+```
+
+对 LLM 来说，**activation 显存通常很敏感**。尤其序列长度长时，显存增长明显。
+
+所以micro_batch_size 从 2 到 4 
+
+不只是数据张量翻倍，activation 也会明显增加。
+
+**GPU利用率/吞吐**
+
+两个方案的有效batch都是32，但是如果显卡能适应micro_batch_size =2 和4，一般后者会更好。因为显存占用率高
+
+```
+方案 A: micro_batch_size=2, grad_acc_steps=16
+方案 B: micro_batch_size=4, grad_acc_steps=8
+```
+
+
+
+## vllm规范
+
+generate的返回值是List[RequestOutput]，长度和我们输入的List[str]（即prompt个数）相等
+
+
+
+```
+RequestOutput
+	prompt:str
+	request_id:str|None
+	prompt_token_ids:list[int] | None
+	outputs:list[CompletionOutput]
+	finished:bool
+```
+
+CompletionOutput 
+
+```
+CompletionOutput 
+	index:int#The index of the output in the request.
+	text:	str
+	token_ids:Sequence[int]
 ```
 

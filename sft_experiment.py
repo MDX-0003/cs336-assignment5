@@ -19,6 +19,11 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from unittest.mock import patch
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from cs336_alignment.sft_utils import (
+    evaluate_vllm,
+    get_ground_truth,
+    get_question,
+)
 from tests.adapters import (
     run_tokenize_prompt_and_output as tokenize_prompt_and_output,
     run_get_response_log_probs as get_response_log_probs,
@@ -30,37 +35,6 @@ from tqdm import tqdm
 
 
 # ====================== SFT Data Tils ======================
-#every question with its answer should be store in class like this
-@dataclass
-class EvalRow:
-    idx: int
-    problem_id: Optional[str]
-    prompt: str
-    ground_truth: Any
-    response: str
-    category: str  # "F1A1", "F1A0", "F0A0"
-    reward: float
-    format_reward: float
-    answer_reward: float
-# MATH jsonl usually has "problem" / "question"or similar
-def get_question(example: Dict[str, Any]) -> str:
-    for key in ["problem", "question", "prompt"]:
-        if key in example and isinstance(example[key], str):
-            return example[key]
-    raise KeyError(f"Cannot find question field in example, actual keys={list(example.keys())}")
-# MATH jsonl usually has "answer" or similar
-# Answer can be str/int/float sowe use any
-def get_ground_truth(example: Dict[str, Any]) -> Any:
-    for key in ["answer", "ground_truth", "target"]:
-        if key in example:
-            return example[key]
-    raise KeyError(f"Cannot find answer field in example, actual keys={list(example.keys())}")
-def get_category(format_reward:float,answer_reward:float):
-    if format_reward == 1.0 and answer_reward == 1.0:
-        return "F1A1"
-    if format_reward == 1.0 and answer_reward == 0.0:
-        return "F1A0"
-    return "F0A0"
 #if args=true,use reward_fn filter the data can get right answer
 #return filter how many examples
 def filter_correct_sft_samples(
@@ -87,17 +61,6 @@ def filter_correct_sft_samples(
             w.write(json.dumps(example, ensure_ascii=False) + "\n")
     
     return {"filtered/kept": len(kept), "filtered/total": total}
-
-
-def load_jsonl(path:str|Path):
-    with open(path) as f:
-        for line in f:
-            yield json.loads(line)
-def write_jsonl(path: str, rows: List[EvalRow]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
 
 # ====================== Data Set/Loader ======================
 class SFTDataset(Dataset):
@@ -173,50 +136,6 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
-
-#after opt backward, new policy eval with sft data and log
-def evaluate_vllm(
-    vllm_model: LLM,
-    reward_fn: Callable[[str, Any], Dict[str, float]],
-    prompts: List[str],
-    ground_truths: List[Any],
-    sample_params: SamplingParams,
-    request_batch_size: int = 64,
-) -> List[EvalRow]:
-    assert len(prompts) == len(ground_truths)
-    eval_rows = [] #List[EvalRow]
-    n = len(prompts)
-    for start in range(0,n,request_batch_size):
-        end = min(start + request_batch_size,n)
-        cur_prompt = prompts[start:end]
-        cur_gt = ground_truths[start:end]
-
-        outputs = vllm_model.generate(cur_prompt,sample_params)
-        #outputs List[RequestOutput]
-        assert len(cur_prompt) == len(outputs)
-
-        for i,request_output in enumerate(outputs):
-            assert request_output.prompt == cur_prompt[i]
-            prompt = request_output.prompt
-            output = request_output.outputs[0].text
-            gt = cur_gt[i]
-            scores = reward_fn(output,gt) # Dict[str,float] reward/format_reward/answer_reward
-            reward = float(scores.get("reward",0.0))
-            format_reward = float(scores.get("format_reward",0.0))
-            answer_reward = float(scores.get("answer_reward",0.0))
-            cur_metadata = EvalRow(
-                idx = start+i,
-                problem_id = None,
-                prompt = prompt,
-                ground_truth = gt,
-                response = output,
-                category = get_category(format_reward,answer_reward),
-                reward=reward,
-                format_reward=format_reward,
-                answer_reward=answer_reward
-            )
-            eval_rows.append(cur_metadata)
-    return eval_rows
 
 def main():
     ap = argparse.ArgumentParser()
@@ -339,7 +258,7 @@ def main():
             out = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
             policy_log_probs = out["log_probs"] 
 
-            # loss should divide by grad_acc_steps 
+            # loss  divide by grad_acc_steps ，SFT loss has no advantage
             # -nll = (log_probs*mask).sum(dim = 1),so shape (Batch_size,)
             # loss = -nll.mean , so loss only one val for whole microBatch
             loss, meta = sft_microbatch_train_step(
