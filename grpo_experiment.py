@@ -2,6 +2,8 @@ import os
 
 # vllm 0.10.0 uses msgpack by default; collective_rpc with callable requires pickle fallback
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 import sys
 from pprint import pprint
 from vllm import LLM,SamplingParams
@@ -14,10 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
+import gc
 import json
+import logging
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from unittest.mock import patch
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from cs336_alignment.sft_utils import (
@@ -49,20 +52,12 @@ def load_policy_into_vllm_instance(policy, llm: LLM):
     llm.llm_engine.collective_rpc(_load_weights)
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     vllm_set_random_seed(seed)
-    world_size_path = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None
+    return LLM(
+        model=model_id,
+        dtype=torch.float16,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
-    #patch : runtime replace internal func return val ,vllm skip memory check and set gpu num
-    # vllm>=0.10.0 removed the `device` kwarg; device is auto-detected from CUDA
-    with world_size_path, profiling_patch:
-        return LLM(
-            model=model_id,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
 
 # ====================== jsonl load ======================
 def load_jsonl(path,
@@ -94,7 +89,7 @@ def load_jsonl(path,
 LossType = Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"]
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(fromfile_prefix_chars="@")
     # ====================== paths ======================
     ap.add_argument("--model_path", default="cs336_alignment/models/Qwen2.5-Math-1.5B")
     ap.add_argument("--sft_path", default="data/MATH/sft.jsonl")
@@ -153,7 +148,11 @@ def main():
                 f.flush()
 
     console_log = open(run_dir / "console.log", "w", encoding="utf-8")
+    # Tee both stdout and stderr to the log file
     sys.stdout = _TeeWriter(sys.__stdout__, console_log)
+    sys.stderr = _TeeWriter(sys.__stderr__, console_log)
+    # Also capture Python logging (vllm uses this)
+    logging.getLogger().addHandler(logging.StreamHandler(console_log))
 
     log_path = run_dir / "log.jsonl"
     def log_event(event: Dict[str, Any], *, also_print: bool = True):
@@ -198,18 +197,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     policy = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
         device_map={"": args.train_device},
     )
     policy.train()
-    # gpu_memory_utilization 0.35 leaves ~5.6GB for vLLM KV cache.
-    # Policy training + vLLM model must share RTX 5080's 16GB.
+    # gpu_memory_utilization 0.20 for V100 32GB: leaves ~25.6GB for policy training
     policy_vllm = init_vllm(
             args.model_path,
             device=args.train_device,
             seed=args.seed,
-            gpu_memory_utilization=0.35
+            gpu_memory_utilization=0.10
         )
     # init_vllm 已从磁盘加载权重，无需重复 load_policy_into_vllm_instance
     # -------- load optimizer --------
@@ -378,7 +376,7 @@ def main():
                 args.model_path,
                 device=args.vllm_device,
                 seed=args.seed,
-                gpu_memory_utilization=0.35
+                gpu_memory_utilization=0.10
             )
             policy.eval()
             with torch.no_grad():
@@ -399,7 +397,9 @@ def main():
             })
 
             del eval_llm
+            gc.collect()
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             policy.to(args.train_device)
             policy.train()
 
@@ -408,7 +408,7 @@ def main():
                 args.model_path,
                 device=args.train_device,
                 seed=args.seed,
-                gpu_memory_utilization=0.35
+                gpu_memory_utilization=0.10
             )
             load_policy_into_vllm_instance(policy, policy_vllm)
         if args.loss_interval >0 and opt_step % args.loss_interval == 0:
@@ -427,10 +427,52 @@ def main():
         #after grads update, store new policy to vllm
         load_policy_into_vllm_instance(policy, policy_vllm)
     pbar.close()
-    policy.save_pretrained(str(run_dir))
-    tokenizer.save_pretrained(str(run_dir))
-    log_event({"type": "save", "out_dir": str(run_dir), "msg": f"Saved: {run_dir}"})
 
-    
+    # --- final save ---
+    final_dir = run_dir / "ckpt_step_final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    policy.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    log_event({"type": "save", "out_dir": str(final_dir), "msg": f"Saved: {final_dir}"})
+
+    # --- final eval (unless --disable_eval) ---
+    if not args.disable_eval:
+        del policy_vllm
+        torch.cuda.empty_cache()
+
+        policy.cpu()
+        torch.cuda.empty_cache()
+
+        eval_llm = init_vllm(
+            args.model_path,
+            device=args.vllm_device,
+            seed=args.seed,
+            gpu_memory_utilization=0.10,
+        )
+        policy.eval()
+        with torch.no_grad():
+            load_policy_into_vllm_instance(policy, eval_llm)
+            rows = evaluate_vllm(
+                vllm_model=eval_llm,
+                reward_fn=r1_zero_reward_fn,
+                prompts=val_question,
+                ground_truths=val_gts,
+                sample_params=eval_sampling_params,
+                request_batch_size=64,
+            )
+        summary = summarize(rows)
+        log_event({
+            "type": "eval_metadata",
+            "metadata": summary,
+            "msg": f"[final] {summary}"
+        })
+
+        del eval_llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        policy.to(args.train_device)
+
+
 if __name__ == "__main__":
     main()

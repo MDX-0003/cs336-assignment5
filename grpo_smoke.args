@@ -1,0 +1,14 @@
+--model_path
+Qwen/Qwen2.5-Math-1.5B
+--train_samples
+8
+--val_samples
+4
+--max_steps
+3
+--eval_interval
+2
+--loss_interval
+1
+--out_path
+runs/grpo_smoke_test

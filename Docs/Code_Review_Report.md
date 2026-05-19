@@ -710,3 +710,45 @@ CompletionOutput
 	token_ids:Sequence[int]
 ```
 
+## 显存计算
+
+grpo实验里，需要用"上次循环的"policy推理一遍，得到old_policy_log_probs，这里在函数外，把input_ids和labels拆出多组micro batch，逐个推理后再拼接结果
+
+这么做对速度、显存有影响吗？
+
+显存：
+Qwen2.5 的 vocab_size 是 151,936。get_response_log_probs 内部做 forward pass 时，最后的 lm_head 会产出 [batch, seq_len, vocab_size] 的 logits 张量。
+
+|方式	|logits 形状	|logits 显存 (bf16)
+|全量 (B=32, T≈1024)	|[32, 1024, 151936]	|~19.9 GB
+|micro-batch (B=2, T≈1024)	|[2, 1024, 151936]	|~1.24 GB
+全量一次计算时，光是 logits 这一个张量就要吃掉近 20GB，加上模型权重（~3GB）、KV cache、中间激活，32GB 的 V100 也会直接 OOM。
+
+拆开后，每次只计算 2 条的 logits，拿到 log_probs（形状 [2, 1024]，极小）后 detach 存下来，logits 随即释放。遍历完 16 个 micro-batch 后 torch.cat 拼回 [32, 1024] 的完整 old_log_probs。
+
+速度：
+拆开更慢，但代价很小：
+
+全量计算：一次 forward，GPU 大矩阵乘法利用率高
+拆开计算：16 次 forward，小 batch 的 GPU 利用率更低
+但这发生在 torch.inference_mode() 下（无梯度追踪），且只在 loss_type == "grpo_clip" 时每步执行一次。相比 rollout 和 training 的耗时，这几十毫秒的差异可以忽略不计。
+```
+# ========== 5) optional , get old policy log probs ==========
+        old_log_probs = None
+        if loss_type == "grpo_clip":
+            # Process in micro-batches to avoid OOM from full (B,T,151K) logits
+            old_log_probs_list = []
+            with torch.inference_mode():
+                for mb_idx in range(grad_acc_steps):
+                    mb_start = mb_idx * micro_batch_size
+                    mb_end = mb_start + micro_batch_size
+                    old_mb_out = get_response_log_probs(
+                        policy,
+                        input_ids[mb_start:mb_end],
+                        labels[mb_start:mb_end],
+                        return_token_entropy=False,  # only need log_probs here
+                    )
+                    old_log_probs_list.append(old_mb_out["log_probs"].detach())
+            old_log_probs = torch.cat(old_log_probs_list, dim=0)  # [B,T]
+            old_log_probs.requires_grad_(False)
+```

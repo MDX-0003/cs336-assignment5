@@ -1,0 +1,10 @@
+--model_path
+Qwen/Qwen2.5-Math-1.5B
+--max_steps
+500
+--eval_interval
+100
+--loss_interval
+100
+--out_path
+runs/grpo_full_run

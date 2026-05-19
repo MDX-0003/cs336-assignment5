@@ -1,10 +1,15 @@
 import os
+import sys
 
 # vllm 0.10.0 uses msgpack by default; collective_rpc with callable requires pickle fallback
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 
 from vllm import LLM,SamplingParams
 import argparse
+import gc
+import logging
 import random
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -172,6 +177,24 @@ def main():
     #run_dir = samples(1000/full)_(filtered/all)
     run_dir = Path(args.out_path) / f"samples{args.train_samples or 'full'}_{'filtered' if args.filter_correct else 'all'}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- tee stdout/stderr + logging to console.log ---
+    class _TeeWriter:
+        def __init__(self, *files):
+            self.files = files
+        def write(self, text):
+            for f in self.files:
+                f.write(text)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    console_log = open(run_dir / "console.log", "w", encoding="utf-8")
+    sys.stdout = _TeeWriter(sys.__stdout__, console_log)
+    sys.stderr = _TeeWriter(sys.__stderr__, console_log)
+    logging.getLogger().addHandler(logging.StreamHandler(console_log))
+
     log_path = run_dir / "log.jsonl"
     def log_event(event: Dict[str, Any], *, also_print: bool = True):
         payload = {
@@ -320,7 +343,9 @@ def main():
                         "msg": f"[step={step}] loss={float(loss.detach()):.4f} {eval_metadata}"})
                 # --- del temp vllm ---
                 del llm
+                gc.collect()
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
                 policy.to(args.train_device)
                 policy.train()
             
